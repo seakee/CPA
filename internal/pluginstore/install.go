@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +36,13 @@ type InstallOptions struct {
 // library that is loaded by the running process on Windows.
 var ErrLoadedPluginLocked = errors.New("loaded plugin library cannot be overwritten while the server is running")
 
+type writtenArtifact struct {
+	path   string
+	sha256 string
+	size   int64
+	info   os.FileInfo
+}
+
 type InstallResult struct {
 	ID          string `json:"id"`
 	Version     string `json:"version"`
@@ -42,6 +51,8 @@ type InstallResult struct {
 	Path        string `json:"path"`
 	Overwritten bool   `json:"overwritten"`
 	Skipped     bool   `json:"skipped"`
+
+	written writtenArtifact
 }
 
 func (c Client) Install(ctx context.Context, plugin Plugin, options InstallOptions) (InstallResult, error) {
@@ -296,14 +307,22 @@ func InstallArchive(archiveData []byte, plugin Plugin, options InstallOptions) (
 	if overwritten && loadedPluginInstallBlocked(options) {
 		return InstallResult{}, ErrLoadedPluginLocked
 	}
-	if errWrite := writeFileAtomic(targetPath, libraryData, mode); errWrite != nil {
+	writtenInfo, errWrite := writeFileAtomic(targetPath, libraryData, mode)
+	if errWrite != nil {
 		return InstallResult{}, errWrite
 	}
+	digest := sha256.Sum256(libraryData)
 	return InstallResult{
 		ID:          id,
 		Version:     strings.TrimSpace(plugin.Version),
 		Path:        targetPath,
 		Overwritten: overwritten,
+		written: writtenArtifact{
+			path:   targetPath,
+			sha256: hex.EncodeToString(digest[:]),
+			size:   int64(len(libraryData)),
+			info:   writtenInfo,
+		},
 	}, nil
 }
 
@@ -516,15 +535,15 @@ func pluginExtension(goos string) string {
 	}
 }
 
-func writeFileAtomic(targetPath string, data []byte, mode os.FileMode) error {
+func writeFileAtomic(targetPath string, data []byte, mode os.FileMode) (os.FileInfo, error) {
 	targetDir := filepath.Dir(targetPath)
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
-		return fmt.Errorf("create plugin directory: %w", errMkdir)
+		return nil, fmt.Errorf("create plugin directory: %w", errMkdir)
 	}
 
 	temp, errTemp := os.CreateTemp(targetDir, "."+filepath.Base(targetPath)+".tmp-*")
 	if errTemp != nil {
-		return fmt.Errorf("create temp plugin file: %w", errTemp)
+		return nil, fmt.Errorf("create temp plugin file: %w", errTemp)
 	}
 	tempPath := temp.Name()
 	removeTemp := true
@@ -543,34 +562,50 @@ func writeFileAtomic(targetPath string, data []byte, mode os.FileMode) error {
 	}()
 
 	if errChmod := temp.Chmod(mode); errChmod != nil {
-		return fmt.Errorf("chmod temp plugin file: %w", errChmod)
+		return nil, fmt.Errorf("chmod temp plugin file: %w", errChmod)
 	}
 	if _, errWrite := temp.Write(data); errWrite != nil {
-		return fmt.Errorf("write temp plugin file: %w", errWrite)
+		return nil, fmt.Errorf("write temp plugin file: %w", errWrite)
 	}
 	if errSync := temp.Sync(); errSync != nil {
-		return fmt.Errorf("sync temp plugin file: %w", errSync)
+		return nil, fmt.Errorf("sync temp plugin file: %w", errSync)
 	}
-	if errClose := temp.Close(); errClose != nil {
-		return fmt.Errorf("close temp plugin file: %w", errClose)
-	}
-	closed = true
-	if errRename := os.Rename(tempPath, targetPath); errRename != nil {
-		if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" {
+		info, errInfo := temp.Stat()
+		if errInfo != nil {
+			return nil, fmt.Errorf("stat temp plugin file: %w", errInfo)
+		}
+		if errClose := temp.Close(); errClose != nil {
+			return nil, fmt.Errorf("close temp plugin file: %w", errClose)
+		}
+		closed = true
+		if errRename := os.Rename(tempPath, targetPath); errRename != nil {
 			if errRemove := os.Remove(targetPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-				return fmt.Errorf("remove old plugin file: %w", errRemove)
+				return nil, fmt.Errorf("remove old plugin file: %w", errRemove)
 			}
 			if errRenameRetry := os.Rename(tempPath, targetPath); errRenameRetry == nil {
 				removeTemp = false
-				return nil
+				return info, nil
 			} else {
-				return fmt.Errorf("install plugin file: %w", errRenameRetry)
+				return nil, fmt.Errorf("install plugin file: %w", errRenameRetry)
 			}
 		}
-		return fmt.Errorf("install plugin file: %w", errRename)
+		removeTemp = false
+		return info, nil
+	}
+	if errRename := os.Rename(tempPath, targetPath); errRename != nil {
+		return nil, fmt.Errorf("install plugin file: %w", errRename)
 	}
 	removeTemp = false
-	return nil
+	info, errInfo := temp.Stat()
+	if errInfo != nil {
+		return nil, fmt.Errorf("stat temp plugin file: %w", errInfo)
+	}
+	if errClose := temp.Close(); errClose != nil {
+		return nil, fmt.Errorf("close temp plugin file: %w", errClose)
+	}
+	closed = true
+	return info, nil
 }
 
 func loadedPluginInstallBlocked(options InstallOptions) bool {
