@@ -259,29 +259,31 @@ func (h *Handler) installPluginFromStore(c *gin.Context, goos, goarch string) {
 		GOARCH:       goarch,
 		PluginLoaded: pluginIsBusy,
 	}
+	installType := pluginstore.PluginInstallType(plugin)
+	if installType != pluginstore.InstallTypeDirect && installType != pluginstore.InstallTypeGitHubRelease {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "plugin_manifest_invalid", "message": fmt.Sprintf("unsupported install type %q", plugin.Install.Type)})
+		return
+	}
 	var manifest pluginstore.Manifest
-	var result pluginstore.InstallResult
-	var errInstall error
-	switch pluginstore.PluginInstallType(plugin) {
-	case pluginstore.InstallTypeDirect:
+	if installType == pluginstore.InstallTypeDirect {
 		var errManifest error
 		manifest, errManifest = pluginStoreDirectManifest(source, plugin, requestedVersion)
 		if errManifest != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"error": "plugin_manifest_invalid", "message": errManifest.Error()})
 			return
 		}
-		result, errInstall = client.InstallManifest(installCtx, manifest, installOptions)
-	case pluginstore.InstallTypeGitHubRelease:
-		result, errInstall = installPluginStoreGitHubRelease(installCtx, client, plugin, requestedVersion, installOptions)
-	default:
-		c.JSON(http.StatusBadGateway, gin.H{"error": "plugin_manifest_invalid", "message": fmt.Sprintf("unsupported install type %q", plugin.Install.Type)})
-		return
 	}
-	if errInstall != nil {
-		if writePluginStoreRateLimit(c, errInstall) {
+	runInstall := func() (pluginstore.InstallResult, error) {
+		if installType == pluginstore.InstallTypeDirect {
+			return client.InstallManifest(installCtx, manifest, installOptions)
+		}
+		return installPluginStoreGitHubRelease(installCtx, client, plugin, requestedVersion, installOptions)
+	}
+	respondInstallError := func(err error) {
+		if writePluginStoreRateLimit(c, err) {
 			return
 		}
-		if errors.Is(errInstall, pluginstore.ErrLoadedPluginLocked) {
+		if errors.Is(err, pluginstore.ErrLoadedPluginLocked) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":            "plugin_update_requires_restart",
 				"message":          "loaded plugin cannot be overwritten while the server is running",
@@ -289,16 +291,81 @@ func (h *Handler) installPluginFromStore(c *gin.Context, goos, goarch string) {
 			})
 			return
 		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": "plugin_install_failed", "message": errInstall.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "plugin_install_failed", "message": err.Error()})
+	}
+	result, errInstall := runInstall()
+	if errInstall != nil {
+		respondInstallError(errInstall)
 		return
 	}
-	if manifest.ID == "" {
+	fillManifest := func() bool {
+		if manifest.ID != "" {
+			return true
+		}
 		var errManifest error
 		manifest, errManifest = pluginStoreManifestForInstall(source, plugin, result)
 		if errManifest != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":   "plugin_manifest_failed",
 				"message": fmt.Sprintf("plugin file installed at %s but creating store manifest failed: %s", result.Path, errManifest.Error()),
+				"path":    result.Path,
+			})
+			return false
+		}
+		return true
+	}
+	if !fillManifest() {
+		return
+	}
+
+	// A skipped install only continues a recorded instance when the previous
+	// receipt still witnesses this file and the source/version did not change.
+	// Any other skipped file was not written by this controlled install: remove
+	// it and let the installer produce a fresh artifact and instance.
+	previous, hadPrevious := h.pluginConfigEntry(id)
+	preserved := false
+	if result.Skipped && hadPrevious {
+		if previousRecord, ok, errRecord := pluginstore.DecodeInstallRecord(yamlMappingValue(&previous.Raw, "install")); ok && errRecord == nil {
+			if errVerify := previousRecord.Verify(id, result.Path, result.Version, source.ID, source.URL); errVerify == nil {
+				preserved = true
+			}
+		}
+	}
+	if result.Skipped && !preserved {
+		// An unqualified same-byte file is never removed or adopted by the
+		// installer. It is not written by this install; only an explicit
+		// DeletePlugin followed by a new install may replace it.
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "plugin_install_unowned_existing_file",
+			"message": fmt.Sprintf("existing plugin file at %s was not written by this install; delete it and reinstall", result.Path),
+			"path":    result.Path,
+		})
+		return
+	}
+
+	var record pluginstore.InstallRecord
+	if preserved {
+		decoded, ok, errRecord := pluginstore.DecodeInstallRecord(yamlMappingValue(&previous.Raw, "install"))
+		if errRecord != nil || !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_install_identity_failed", "message": "the recorded installation instance could not be decoded"})
+			return
+		}
+		record = decoded
+	} else {
+		var errRecord error
+		record, errRecord = pluginstore.NewInstallRecordFromOutcome(id, result, source.ID, source.URL)
+		if errRecord != nil {
+			if errors.Is(errRecord, pluginstore.ErrInstallArtifactReplaced) {
+				c.JSON(http.StatusConflict, gin.H{
+					"error":   "plugin_install_source_unverified",
+					"message": fmt.Sprintf("plugin file at %s was replaced before its installation source could be recorded; delete it and reinstall", result.Path),
+					"path":    result.Path,
+				})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "plugin_install_identity_failed",
+				"message": fmt.Sprintf("plugin file installed at %s but recording its installation instance failed: %s", result.Path, errRecord.Error()),
 				"path":    result.Path,
 			})
 			return
@@ -316,7 +383,16 @@ func (h *Handler) installPluginFromStore(c *gin.Context, goos, goarch string) {
 		})
 		return
 	}
+	previous, hadPrevious = h.cfg.Plugins.Configs[id]
+	restorePrevious := func() {
+		if hadPrevious {
+			h.cfg.Plugins.Configs[id] = previous
+			return
+		}
+		delete(h.cfg.Plugins.Configs, id)
+	}
 	if errEnable := h.enablePluginConfigLocked(id, manifest); errEnable != nil {
+		restorePrevious()
 		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "config_update_failed",
@@ -325,7 +401,42 @@ func (h *Handler) installPluginFromStore(c *gin.Context, goos, goarch string) {
 		})
 		return
 	}
+	if preserved {
+		liveRecord, ok, errRecord := pluginstore.DecodeInstallRecord(yamlMappingValue(&previous.Raw, "install"))
+		if errRecord != nil || !ok || liveRecord.Verify(id, result.Path, result.Version, source.ID, source.URL) != nil {
+			restorePrevious()
+			h.mu.Unlock()
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   "plugin_install_identity_changed",
+				"message": "the existing installation record no longer matches the plugin file; delete it and reinstall",
+				"path":    result.Path,
+			})
+			return
+		}
+	} else {
+		if errVerify := record.Verify(id, result.Path, result.Version, source.ID, source.URL); errVerify != nil {
+			restorePrevious()
+			h.mu.Unlock()
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   "plugin_install_source_unverified",
+				"message": fmt.Sprintf("plugin file at %s was replaced before its installation source could be recorded; delete it and reinstall", result.Path),
+				"path":    result.Path,
+			})
+			return
+		}
+		if errRecord := h.setPluginInstallRecordLocked(id, record); errRecord != nil {
+			restorePrevious()
+			h.mu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "config_update_failed",
+				"message": fmt.Sprintf("plugin file installed at %s but recording its installation instance failed: %s", result.Path, errRecord.Error()),
+				"path":    result.Path,
+			})
+			return
+		}
+	}
 	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); errSave != nil {
+		restorePrevious()
 		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "config_save_failed",
@@ -505,6 +616,51 @@ func (h *Handler) enablePluginConfigLocked(id string, storeManifest pluginstore.
 	}
 	h.cfg.Plugins.Configs[id] = updated
 	return nil
+}
+
+// pluginConfigEntry returns a point-in-time copy of one plugin config entry.
+func (h *Handler) pluginConfigEntry(id string) (config.PluginInstanceConfig, bool) {
+	if h == nil {
+		return config.PluginInstanceConfig{}, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return config.PluginInstanceConfig{}, false
+	}
+	item, ok := h.cfg.Plugins.Configs[id]
+	return item, ok
+}
+
+// setPluginInstallRecordLocked persists the host-owned installation receipt
+// next to the store manifest. Callers must hold h.mu.
+func (h *Handler) setPluginInstallRecordLocked(id string, record pluginstore.InstallRecord) error {
+	ensurePluginConfigMap(h.cfg)
+	node := pluginConfigNode(h.cfg.Plugins.Configs[id])
+	recordNode, errRecordNode := pluginstore.EncodeInstallRecord(record)
+	if errRecordNode != nil {
+		return errRecordNode
+	}
+	setYAMLMappingValue(node, "install", recordNode)
+	updated, errConfig := pluginInstanceConfigFromNode(node)
+	if errConfig != nil {
+		return fmt.Errorf("decode plugin config: %w", errConfig)
+	}
+	h.cfg.Plugins.Configs[id] = updated
+	return nil
+}
+
+// preservePluginInstallRecord keeps the host-owned installation receipt out of
+// plugin configuration writes. A request may not add, remove, or replace it.
+func preservePluginInstallRecord(node *yaml.Node, existing config.PluginInstanceConfig) {
+	if node == nil {
+		return
+	}
+	deleteYAMLMappingKey(node, "install")
+	installNode := yamlMappingValue(&existing.Raw, "install")
+	if installNode != nil && installNode.Kind != 0 {
+		setYAMLMappingValue(node, "install", cloneYAMLNode(installNode))
+	}
 }
 
 func pluginStoreManifestYAMLNode(manifest pluginstore.Manifest) (*yaml.Node, error) {

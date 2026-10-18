@@ -265,15 +265,18 @@ func (h *Handler) PutPluginConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
 		return
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ensurePluginConfigMap(h.cfg)
+	// The installation receipt is host-owned; a full plugin config write must
+	// not drop or replace it.
+	preservePluginInstallRecord(node, h.cfg.Plugins.Configs[id])
 	updated, errConfig := pluginInstanceConfigFromNode(node)
 	if errConfig != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
 		return
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	ensurePluginConfigMap(h.cfg)
 	h.cfg.Plugins.Configs[id] = updated
 	h.persistLocked(c)
 }
@@ -311,6 +314,7 @@ func (h *Handler) PatchPluginConfig(c *gin.Context) {
 		}
 		setYAMLMappingValue(node, key, valueNode)
 	}
+	preservePluginInstallRecord(node, h.cfg.Plugins.Configs[id])
 	updated, errConfig := pluginInstanceConfigFromNode(node)
 	if errConfig != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": errConfig.Error()})
